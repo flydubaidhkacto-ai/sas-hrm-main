@@ -1,0 +1,64 @@
+@extends('layouts.master')
+@section('title', 'Unit Edit')
+@section('content')
+
+    <!-- Page Wrapper -->
+    <div class="page-wrapper">
+        <!-- Page Content -->
+        <div class="content container-fluid">
+            <!-- Page Header -->
+            <div class="page-header">
+                <div class="row align-items-center">
+                    <div class="col">
+                        <h3 class="page-title">Edit Unit</h3>
+                        <ul class="breadcrumb">
+                            <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
+                            <li class="breadcrumb-item"><a href="{{ route('inventory.unit.index') }}">Unit</a></li>
+                            <li class="breadcrumb-item active">Edit</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            @include('layouts.alerts')
+            <form id="employee-form" action="{{ route('inventory.unit.update', $unit->id) }}" method="POST">
+                @csrf
+                @method('PUT')
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label class="col-form-label">Name<sup class="text-danger">*</sup>:</label>
+                            <input type="text" name="name" class="form-control" required
+                                value="{{ $unit->name }}">
+                            @if ($errors->has('name'))
+                                <span class="text-danger">{{ $errors->first('name') }}</span>
+                            @endif
+                        </div>
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label>Status</label>
+                            <select class="select form-control" id="status" name="status">
+                                <option value="">--Select--</option>
+                                <option value="0" {{ $unit->status == 0 ? 'selected' : '' }}> Deactive
+                                </option>
+                                <option value="1" {{ $unit->status == 1 ? 'selected' : '' }}> Active
+                                </option>
+                            </select>
+                            @if ($errors->has('status'))
+                                <span class="text-danger">{{ $errors->first('status') }}</span>
+                            @endif
+                        </div>
+                    </div>
+
+                </div>
+                <div class="row">
+                    <div class="col-md-12">
+                        <button class="btn-block btn btn-primary">Update</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+@endsection

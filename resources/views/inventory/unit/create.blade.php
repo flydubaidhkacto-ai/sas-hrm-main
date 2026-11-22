@@ -1,0 +1,61 @@
+@extends('layouts.master')
+@section('title', 'Create Unit')
+@section('content')
+
+    <!-- Page Wrapper -->
+    <div class="page-wrapper">
+        <!-- Page Content -->
+        <div class="content container-fluid">
+            <!-- Page Header -->
+            <div class="page-header">
+                <div class="row align-items-center">
+                    <div class="col">
+                        <h3 class="page-title">Create Unit</h3>
+                        <ul class="breadcrumb">
+                            <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
+                            <li class="breadcrumb-item"><a href="{{ route('inventory.unit.index') }}">Unit</a></li>
+                            <li class="breadcrumb-item active">Create</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+
+            <form id="employee-form" action="{{ route('inventory.unit.store') }}" method="POST">
+                @csrf
+                @method('POST')
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label class="col-form-label">Name<sup class="text-danger">*</sup>:</label>
+                            <input type="text" name="name" class="form-control" required value="{{ old('name') }}">
+                            @if ($errors->has('name'))
+                                <span class="text-danger">{{ $errors->first('name') }}</span>
+                            @endif
+                        </div>
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label>Status</label>
+                            <select class="select form-control" id="status" name="status">
+                                <option value="">--Select--</option>
+                                <option value="0">Deactive</option>
+                                <option value="1">Active</option>
+                            </select>
+                            @if ($errors->has('status'))
+                                <span class="text-danger">{{ $errors->first('status') }}</span>
+                            @endif
+                        </div>
+                    </div>
+
+                </div>
+                <div class="row">
+                    <div class="col-md-12">
+                        <button class="btn-block btn btn-primary">Save</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+@endsection
