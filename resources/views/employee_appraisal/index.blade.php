@@ -475,7 +475,7 @@
                 var clearButton = document.querySelector('[data-clear-signature="' + canvas.id + '"]');
                 if (clearButton) {
                     clearButton.addEventListener('click', function () {
-                        context.clearRect(0, 0, canvas.width, canvas.height);
+                        context.clearRect(0, 0, canvas.width / ratio, canvas.height / ratio);
                     });
                 }
             });
