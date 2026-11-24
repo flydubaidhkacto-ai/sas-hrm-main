@@ -1578,7 +1578,7 @@
                         </li>
 
                         <li class="submenu">
-                            <a href="#" class="{{ set_active(['official-form.index']) ? 'noti-dot' : '' }}">
+                            <a href="#" class="{{ set_active(['official-form.index', 'employee-appraisal.index']) ? 'noti-dot' : '' }}">
                                 <i class="fa fa-file"></i>
                                 <span> Official Forms </span>
                                 <span class="menu-arrow"></span>
@@ -1589,6 +1589,13 @@
                                     <a class="{{ set_active(['official-form-generate.index']) }}"
                                        href="{{ Route::has('official-form-generate.index') ? route('official-form-generate.index') : '#' }}">
                                         Form Generate
+                                    </a>
+                                </li>
+
+                                <li>
+                                    <a class="{{ set_active(['employee-appraisal.index']) }}"
+                                       href="{{ route('employee-appraisal.index') }}">
+                                        Employee Appraisal
                                     </a>
                                 </li>
 

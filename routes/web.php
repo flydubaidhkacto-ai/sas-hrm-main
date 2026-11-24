@@ -407,6 +407,7 @@ Route::middleware([
 
         Route::resource('official-form', OfficialFormController::class);
         Route::resource('official-form-generate', GenerateOfficialFormController::class);
+        Route::view('employee-appraisal', 'employee_appraisal.index')->name('employee-appraisal.index');
 
         // Approval Process Routes
         Route::resource('approval-processes', \App\Http\Controllers\ApprovalProcessController::class);
