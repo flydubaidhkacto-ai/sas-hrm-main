@@ -1,0 +1,1147 @@
+diff -ruN orig/app/Http/Controllers/AppraisalController.php new/app/Http/Controllers/AppraisalController.php
+--- orig/app/Http/Controllers/AppraisalController.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Http/Controllers/AppraisalController.php	2026-11-25 04:35:21.053289366 +0000
+@@ -0,0 +1,241 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\Appraisal;
++use App\Models\AppraisalCriterion;
++use App\Support\AppraisalAccess;
++use App\Models\User;
++use App\Support\Scoring;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\DB;
++
++class AppraisalController extends Controller
++{
++    public function index(Request $request)
++    {
++        $u = $request->user();
++        $q = Appraisal::with(['employee.department', 'employee.designation'])->latest();
++
++        if (!AppraisalAccess::seesAll($u)) {
++            $q->where(function ($w) use ($u) {
++                $w->where('employee_id', $u->id)->orWhere('supervisor_id', $u->id);
++                if (AppraisalAccess::is($u, 'hod')) {
++                    $w->orWhereHas('employee', fn ($e) => $e->where('department_id', $u->department_id));
++                }
++            });
++        }
++
++        return view('appraisals.index', [
++            'appraisals' => $q->paginate(15),
++            'user' => $u,
++        ]);
++    }
++
++    public function create(Request $request)
++    {
++        abort_unless(AppraisalAccess::isHr($request->user()), 403);
++
++        return view('appraisals.create', [
++            'employees' => User::active_employees()->whereNotNull('appraisal_supervisor_id')->orderBy('name')->get(),
++        ]);
++    }
++
++    public function store(Request $request)
++    {
++        abort_unless(AppraisalAccess::isHr($request->user()), 403);
++
++        $data = $request->validate([
++            'employee_id' => 'required|exists:users,id',
++            'period' => 'required|string|max:100',
++        ]);
++
++        $employee = User::findOrFail($data['employee_id']);
++        if (!$employee->appraisal_supervisor_id) {
++            return back()->withErrors(['employee_id' => 'This employee has no appraisal supervisor assigned (see Appraisal Setup).'])->withInput();
++        }
++
++        $appraisal = DB::transaction(function () use ($data, $employee, $request) {
++            $a = Appraisal::create([
++                'employee_id' => $employee->id,
++                'supervisor_id' => $employee->appraisal_supervisor_id,
++                'created_by' => $request->user()->id,
++                'period' => $data['period'],
++            ]);
++            foreach (AppraisalCriterion::orderBy('code')->get() as $c) {
++                $a->ratings()->create(['criterion_id' => $c->id]);
++            }
++            return $a;
++        });
++
++        return redirect()->route('appraisals.show', $appraisal)->with('status', 'Appraisal created.');
++    }
++
++    public function show(Request $request, Appraisal $appraisal)
++    {
++        $u = $request->user();
++        abort_unless($appraisal->visibleTo($u), 403);
++
++        $appraisal->load(['employee.department', 'employee.designation', 'supervisor', 'ratings.criterion', 'jobItems', 'reviews.reviewer']);
++
++        return view('appraisals.show', [
++            'appraisal' => $appraisal,
++            'canAct' => $appraisal->canBeActedBy($u),
++            'ratings' => $appraisal->ratings->sortBy('criterion.code'),
++        ]);
++    }
++
++    public function print(Request $request, Appraisal $appraisal)
++    {
++        abort_unless($appraisal->visibleTo($request->user()), 403);
++        $appraisal->load(['employee.department', 'employee.designation', 'supervisor', 'ratings.criterion', 'jobItems', 'reviews.reviewer']);
++
++        return view('appraisals.print', [
++            'appraisal' => $appraisal,
++            'ratings' => $appraisal->ratings->sortBy('criterion.code'),
++        ]);
++    }
++
++    /** Sections 1-3 + supervisor's result block */
++    public function saveSupervisor(Request $request, Appraisal $appraisal)
++    {
++        abort_unless($appraisal->status === 'pending_supervisor' && $appraisal->canBeActedBy($request->user()), 403);
++
++        $data = $request->validate([
++            'ratings' => 'required|array',
++            'ratings.*.level' => 'nullable|in:low,mid,high',
++            'ratings.*.marks' => 'required|integer|min:1|max:10',
++            'ratings.*.comment' => 'nullable|string|max:2000',
++            'jobs' => 'nullable|array|max:10',
++            'jobs.*.description' => 'nullable|string|max:500',
++            'jobs.*.is_satisfactory' => 'nullable|in:0,1',
++            'jobs.*.standard' => 'nullable|in:BS,MS,ES',
++            'review.marks' => 'nullable|numeric|min:0|max:100',
++            'review.recommendation' => 'required|in:' . implode(',', Scoring::RECOMMENDATIONS),
++            'review.increment_steps' => 'required|integer|min:1|max:4',
++            'review.comment' => 'nullable|string|max:2000',
++        ]);
++
++        DB::transaction(function () use ($data, $appraisal, $request) {
++            foreach ($data['ratings'] as $id => $r) {
++                $appraisal->ratings()->whereKey($id)->update([
++                    'level' => $r['level'] ?? null,
++                    'marks' => $r['marks'],
++                    'comment' => $r['comment'] ?? null,
++                ]);
++            }
++
++            $appraisal->jobItems()->delete();
++            foreach ($data['jobs'] ?? [] as $j) {
++                if (blank($j['description'] ?? null)) {
++                    continue;
++                }
++                $appraisal->jobItems()->create([
++                    'description' => $j['description'],
++                    'is_satisfactory' => isset($j['is_satisfactory']) && $j['is_satisfactory'] !== '' ? (bool) $j['is_satisfactory'] : null,
++                    'standard' => $j['standard'] ?? null,
++                ]);
++            }
++
++            $appraisal->total_percent = $appraisal->computeTotal();
++            $appraisal->save();
++
++            $this->storeReview($appraisal, 'supervisor', $data['review'], $request->user());
++            $appraisal->advance();
++        });
++
++        return redirect()->route('appraisals.show', $appraisal)->with('status', 'Supervisor evaluation submitted.');
++    }
++
++    /** Section 4 - Employee comment */
++    public function saveEmployee(Request $request, Appraisal $appraisal)
++    {
++        abort_unless($appraisal->status === 'pending_employee' && $appraisal->canBeActedBy($request->user()), 403);
++
++        $data = $request->validate(['employee_comment' => 'nullable|string|max:5000']);
++
++        $appraisal->update([
++            'employee_comment' => $data['employee_comment'] ?? null,
++            'employee_signed_at' => now(),
++        ]);
++        $appraisal->advance();
++
++        return redirect()->route('appraisals.show', $appraisal)->with('status', 'Your comment has been saved.');
++    }
++
++    /** HOD / HR / MD review */
++    public function review(Request $request, Appraisal $appraisal, string $stage)
++    {
++        abort_unless(in_array($stage, ['hod', 'hr', 'md'], true), 404);
++        abort_unless($appraisal->status === "pending_$stage" && $appraisal->canBeActedBy($request->user()), 403);
++
++        $data = $request->validate([
++            'marks' => 'required|numeric|min:0|max:100',
++            'recommendation' => 'required|in:' . implode(',', Scoring::RECOMMENDATIONS),
++            'increment_steps' => 'required|integer|min:1|max:4',
++            'comment' => 'nullable|string|max:2000',
++        ]);
++
++        DB::transaction(function () use ($appraisal, $stage, $data, $request) {
++            $this->storeReview($appraisal, $stage, $data, $request->user());
++            if ($stage === 'md') {
++                $appraisal->final_marks = $data['marks'];
++            }
++            $appraisal->advance();
++        });
++
++        return redirect()->route('appraisals.show', $appraisal)->with('status', 'Review submitted.');
++    }
++
++    /** Assign appraisal roles + supervisors (HR / super admin only) */
++    public function setup(Request $request)
++    {
++        abort_unless(AppraisalAccess::isHr($request->user()), 403);
++
++        $users = User::active_employees()->with('department')->orderBy('name')->get();
++        return view('appraisals.setup', [
++            'users' => $users,
++            'roles' => AppraisalAccess::ROLES,
++        ]);
++    }
++
++    public function setupSave(Request $request)
++    {
++        abort_unless(AppraisalAccess::isHr($request->user()), 403);
++
++        $data = $request->validate([
++            'users' => 'required|array',
++            'users.*.appraisal_role' => 'nullable|in:' . implode(',', array_keys(AppraisalAccess::ROLES)),
++            'users.*.appraisal_supervisor_id' => 'nullable|exists:users,id',
++        ]);
++
++        DB::transaction(function () use ($data) {
++            foreach ($data['users'] as $id => $row) {
++                User::whereKey($id)->update([
++                    'appraisal_role' => $row['appraisal_role'] ?: null,
++                    'appraisal_supervisor_id' => $row['appraisal_supervisor_id'] ?: null,
++                ]);
++            }
++        });
++
++        return redirect()->route('appraisals.setup')->with('status', 'Appraisal setup saved.');
++    }
++
++    private function storeReview(Appraisal $appraisal, string $stage, array $d, User $user): void
++    {
++        $marks = (float) ($d['marks'] ?? $appraisal->total_percent ?? 0);
++
++        $appraisal->reviews()->updateOrCreate(
++            ['stage' => $stage],
++            [
++                'reviewer_id' => $user->id,
++                'marks' => $marks,
++                'result_band' => Scoring::band($marks)['label'],
++                'recommendation' => $d['recommendation'],
++                'increment_steps' => $d['increment_steps'],
++                'comment' => $d['comment'] ?? null,
++                'signed_at' => now(),
++            ]
++        );
++    }
++}
+diff -ruN orig/app/Models/Appraisal.php new/app/Models/Appraisal.php
+--- orig/app/Models/Appraisal.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Models/Appraisal.php	2026-11-25 04:35:21.053219800 +0000
+@@ -0,0 +1,95 @@
++<?php
++
++namespace App\Models;
++
++use App\Support\AppraisalAccess;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\HasMany;
++
++class Appraisal extends Model
++{
++    public const FLOW = [
++        'pending_supervisor', 'pending_employee', 'pending_hod',
++        'pending_hr', 'pending_md', 'completed',
++    ];
++
++    public const STATUS_LABELS = [
++        'pending_supervisor' => 'Waiting for Supervisor',
++        'pending_employee'   => 'Waiting for Employee comment',
++        'pending_hod'        => 'Waiting for Head of Department',
++        'pending_hr'         => 'Waiting for HR',
++        'pending_md'         => 'Waiting for Managing Director',
++        'completed'          => 'Completed',
++    ];
++
++    protected $fillable = [
++        'employee_id', 'supervisor_id', 'created_by', 'period', 'status',
++        'total_percent', 'final_marks', 'employee_comment', 'employee_signed_at',
++    ];
++
++    protected $casts = ['employee_signed_at' => 'datetime'];
++
++    public function employee(): BelongsTo { return $this->belongsTo(User::class, 'employee_id')->withTrashed(); }
++    public function supervisor(): BelongsTo { return $this->belongsTo(User::class, 'supervisor_id'); }
++    public function ratings(): HasMany { return $this->hasMany(AppraisalRating::class); }
++    public function jobItems(): HasMany { return $this->hasMany(AppraisalJobItem::class); }
++    public function reviews(): HasMany { return $this->hasMany(AppraisalReview::class); }
++
++    public function review(string $stage): ?AppraisalReview
++    {
++        return $this->reviews->firstWhere('stage', $stage);
++    }
++
++    public function statusLabel(): string
++    {
++        return self::STATUS_LABELS[$this->status] ?? $this->status;
++    }
++
++    /** Can this user act on the appraisal in its current status? */
++    public function canBeActedBy(User $u): bool
++    {
++        if ($this->status === 'completed') {
++            return false;
++        }
++        if (AppraisalAccess::isAdmin($u) && $this->status !== 'pending_employee') {
++            return true;
++        }
++
++        return match ($this->status) {
++            'pending_supervisor' => $u->id == $this->supervisor_id,
++            'pending_employee'   => $u->id == $this->employee_id,
++            'pending_hod'        => AppraisalAccess::is($u, 'hod') && $u->department_id == $this->employee->department_id,
++            'pending_hr'         => AppraisalAccess::is($u, 'hr'),
++            'pending_md'         => AppraisalAccess::is($u, 'md'),
++            default              => false,
++        };
++    }
++
++    public function visibleTo(User $u): bool
++    {
++        if (AppraisalAccess::seesAll($u)) {
++            return true;
++        }
++        if ($u->id == $this->employee_id || $u->id == $this->supervisor_id) {
++            return true;
++        }
++        return AppraisalAccess::is($u, 'hod') && $u->department_id == $this->employee->department_id;
++    }
++
++    public function advance(): void
++    {
++        $i = array_search($this->status, self::FLOW, true);
++        $this->status = self::FLOW[min($i + 1, count(self::FLOW) - 1)];
++        $this->save();
++    }
++
++    public function computeTotal(): float
++    {
++        $ratings = $this->ratings()->whereNotNull('marks')->get();
++        if ($ratings->isEmpty()) {
++            return 0;
++        }
++        return round($ratings->sum('marks') / ($ratings->count() * 10) * 100, 2);
++    }
++}
+diff -ruN orig/app/Models/AppraisalCriterion.php new/app/Models/AppraisalCriterion.php
+--- orig/app/Models/AppraisalCriterion.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Models/AppraisalCriterion.php	2026-11-25 04:35:21.053200521 +0000
+@@ -0,0 +1,11 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++
++class AppraisalCriterion extends Model
++{
++    protected $table = 'appraisal_criteria';
++    protected $fillable = ['code', 'section', 'title', 'low_text', 'mid_text', 'high_text'];
++}
+diff -ruN orig/app/Models/AppraisalJobItem.php new/app/Models/AppraisalJobItem.php
+--- orig/app/Models/AppraisalJobItem.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Models/AppraisalJobItem.php	2026-11-25 04:35:21.053172438 +0000
+@@ -0,0 +1,12 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++
++class AppraisalJobItem extends Model
++{
++    protected $fillable = ['appraisal_id', 'description', 'is_satisfactory', 'standard'];
++
++    protected $casts = ['is_satisfactory' => 'boolean'];
++}
+diff -ruN orig/app/Models/AppraisalRating.php new/app/Models/AppraisalRating.php
+--- orig/app/Models/AppraisalRating.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Models/AppraisalRating.php	2026-11-25 04:35:21.053210386 +0000
+@@ -0,0 +1,16 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++class AppraisalRating extends Model
++{
++    protected $fillable = ['appraisal_id', 'criterion_id', 'level', 'marks', 'comment'];
++
++    public function criterion(): BelongsTo
++    {
++        return $this->belongsTo(AppraisalCriterion::class);
++    }
++}
+diff -ruN orig/app/Models/AppraisalReview.php new/app/Models/AppraisalReview.php
+--- orig/app/Models/AppraisalReview.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Models/AppraisalReview.php	2026-11-25 04:35:21.053189077 +0000
+@@ -0,0 +1,21 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++class AppraisalReview extends Model
++{
++    protected $fillable = [
++        'appraisal_id', 'stage', 'reviewer_id', 'marks', 'result_band',
++        'recommendation', 'increment_steps', 'comment', 'signed_at',
++    ];
++
++    protected $casts = ['signed_at' => 'datetime'];
++
++    public function reviewer(): BelongsTo
++    {
++        return $this->belongsTo(User::class, 'reviewer_id');
++    }
++}
+diff -ruN orig/app/Support/AppraisalAccess.php new/app/Support/AppraisalAccess.php
+--- orig/app/Support/AppraisalAccess.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Support/AppraisalAccess.php	2026-11-25 04:35:21.053264149 +0000
+@@ -0,0 +1,36 @@
++<?php
++
++namespace App\Support;
++
++use App\Models\User;
++
++/**
++ * Appraisal-specific roles. Kept separate from users.role / Role permissions of SAS HRM.
++ * users.appraisal_role: supervisor | hod | hr | md  (null = normal employee)
++ * super_admin can create appraisals and act on any pending stage (admin override).
++ */
++class AppraisalAccess
++{
++    public const ROLES = ['supervisor' => 'Supervisor', 'hod' => 'Head of Department', 'hr' => 'HR', 'md' => 'Managing Director'];
++
++    public static function isAdmin(User $u): bool
++    {
++        return $u->role === 'super_admin';
++    }
++
++    public static function is(User $u, string $role): bool
++    {
++        return $u->appraisal_role === $role;
++    }
++
++    /** May create appraisals / manage setup */
++    public static function isHr(User $u): bool
++    {
++        return self::isAdmin($u) || self::is($u, 'hr');
++    }
++
++    public static function seesAll(User $u): bool
++    {
++        return self::isAdmin($u) || self::is($u, 'hr') || self::is($u, 'md');
++    }
++}
+diff -ruN orig/app/Support/Scoring.php new/app/Support/Scoring.php
+--- orig/app/Support/Scoring.php	1970-01-01 00:00:00.000000000 +0000
++++ new/app/Support/Scoring.php	2026-11-25 04:35:21.053253571 +0000
+@@ -0,0 +1,28 @@
++<?php
++
++namespace App\Support;
++
++/**
++ * Result band, recommendation and increment steps by marks (form's table).
++ * Edit here if your policy differs.
++ */
++class Scoring
++{
++    public const RECOMMENDATIONS = [
++        'Promotion',
++        'Not recommended for promotion',
++        'Only Increment',
++        'No Increment',
++    ];
++
++    public static function band(float $marks): array
++    {
++        return match (true) {
++            $marks <= 40 => ['label' => 'Poor',          'recommendation' => 'Not recommended for promotion', 'steps' => 1],
++            $marks <= 60 => ['label' => 'Average',       'recommendation' => 'Not recommended for promotion', 'steps' => 2],
++            $marks <= 80 => ['label' => 'Above Average', 'recommendation' => 'Only Increment',                'steps' => 3],
++            $marks <= 90 => ['label' => 'High Average',  'recommendation' => 'Promotion',                     'steps' => 4],
++            default      => ['label' => 'Excellent',     'recommendation' => 'Promotion',                     'steps' => 4],
++        };
++    }
++}
+diff -ruN orig/database/migrations/2026_11_25_000001_add_appraisal_fields_to_users_table.php new/database/migrations/2026_11_25_000001_add_appraisal_fields_to_users_table.php
+--- orig/database/migrations/2026_11_25_000001_add_appraisal_fields_to_users_table.php	1970-01-01 00:00:00.000000000 +0000
++++ new/database/migrations/2026_11_25_000001_add_appraisal_fields_to_users_table.php	2026-11-25 04:35:21.053314005 +0000
+@@ -0,0 +1,28 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            // NOT users.role (that column already drives SAS HRM permissions).
++            if (!Schema::hasColumn('users', 'appraisal_role')) {
++                $table->string('appraisal_role')->nullable(); // supervisor | hod | hr | md
++            }
++            if (!Schema::hasColumn('users', 'appraisal_supervisor_id')) {
++                $table->unsignedBigInteger('appraisal_supervisor_id')->nullable()->index();
++            }
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::table('users', function (Blueprint $table) {
++            $table->dropColumn(['appraisal_role', 'appraisal_supervisor_id']);
++        });
++    }
++};
+diff -ruN orig/database/migrations/2026_11_25_000002_create_appraisal_tables.php new/database/migrations/2026_11_25_000002_create_appraisal_tables.php
+--- orig/database/migrations/2026_11_25_000002_create_appraisal_tables.php	1970-01-01 00:00:00.000000000 +0000
++++ new/database/migrations/2026_11_25_000002_create_appraisal_tables.php	2026-11-25 04:35:21.053323896 +0000
+@@ -0,0 +1,79 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('appraisal_criteria', function (Blueprint $t) {
++            $t->id();
++            $t->unsignedTinyInteger('code')->unique();
++            $t->string('section')->default('one'); // one | three
++            $t->string('title');
++            $t->text('low_text')->nullable();
++            $t->text('mid_text')->nullable();
++            $t->text('high_text')->nullable();
++            $t->timestamps();
++        });
++
++        Schema::create('appraisals', function (Blueprint $t) {
++            $t->id();
++            $t->unsignedBigInteger('employee_id')->index();
++            $t->unsignedBigInteger('supervisor_id')->nullable()->index();
++            $t->unsignedBigInteger('created_by')->nullable();
++            $t->string('period');
++            $t->string('status')->default('pending_supervisor');
++            $t->decimal('total_percent', 5, 2)->nullable();
++            $t->decimal('final_marks', 5, 2)->nullable();
++            $t->text('employee_comment')->nullable();
++            $t->timestamp('employee_signed_at')->nullable();
++            $t->timestamps();
++        });
++
++        Schema::create('appraisal_ratings', function (Blueprint $t) {
++            $t->id();
++            $t->foreignId('appraisal_id')->constrained('appraisals')->cascadeOnDelete();
++            $t->foreignId('criterion_id')->constrained('appraisal_criteria')->cascadeOnDelete();
++            $t->string('level')->nullable(); // low|mid|high
++            $t->unsignedTinyInteger('marks')->nullable(); // 1-10
++            $t->text('comment')->nullable();
++            $t->timestamps();
++        });
++
++        Schema::create('appraisal_job_items', function (Blueprint $t) {
++            $t->id();
++            $t->foreignId('appraisal_id')->constrained('appraisals')->cascadeOnDelete();
++            $t->string('description');
++            $t->boolean('is_satisfactory')->nullable();
++            $t->string('standard')->nullable(); // BS|MS|ES
++            $t->timestamps();
++        });
++
++        Schema::create('appraisal_reviews', function (Blueprint $t) {
++            $t->id();
++            $t->foreignId('appraisal_id')->constrained('appraisals')->cascadeOnDelete();
++            $t->string('stage'); // supervisor|hod|hr|md
++            $t->unsignedBigInteger('reviewer_id')->nullable();
++            $t->decimal('marks', 5, 2);
++            $t->string('result_band');
++            $t->string('recommendation');
++            $t->unsignedTinyInteger('increment_steps');
++            $t->text('comment')->nullable();
++            $t->timestamp('signed_at')->nullable();
++            $t->timestamps();
++            $t->unique(['appraisal_id', 'stage']);
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('appraisal_reviews');
++        Schema::dropIfExists('appraisal_job_items');
++        Schema::dropIfExists('appraisal_ratings');
++        Schema::dropIfExists('appraisals');
++        Schema::dropIfExists('appraisal_criteria');
++    }
++};
+diff -ruN orig/database/seeders/AppraisalCriteriaSeeder.php new/database/seeders/AppraisalCriteriaSeeder.php
+--- orig/database/seeders/AppraisalCriteriaSeeder.php	1970-01-01 00:00:00.000000000 +0000
++++ new/database/seeders/AppraisalCriteriaSeeder.php	2026-11-25 04:35:21.053338434 +0000
+@@ -0,0 +1,34 @@
++<?php
++
++namespace Database\Seeders;
++
++use App\Models\AppraisalCriterion;
++use Illuminate\Database\Seeder;
++
++class AppraisalCriteriaSeeder extends Seeder
++{
++    public function run(): void
++    {
++        // NOTE: criteria 1-4 were not in the photographed pages: these are PLACEHOLDERS. Edit to match your form.
++        $rows = [
++            [1, 'one', 'Knowledge of Work', 'Lacks basic knowledge of the job.', 'Has adequate knowledge of the job.', 'Has thorough knowledge of the job.'],
++            [2, 'one', 'Quality of Work', 'Work is often inaccurate and needs rework.', 'Work is generally accurate and acceptable.', 'Work is consistently accurate and of high quality.'],
++            [3, 'one', 'Productivity', 'Output is below requirement.', 'Output meets requirement.', 'Output consistently exceeds requirement.'],
++            [4, 'one', 'Initiative', 'Needs constant direction.', 'Acts on own initiative when required.', 'Highly self-motivated and proactive.'],
++            [5, 'one', 'Attendance', 'Tries to come early but late attendance is common', 'Regular but needs improvement', 'Always on time and Punctual'],
++            [6, 'one', 'Communication Skills', 'Communication skills impair work performance.', 'Possesses the required communication skills and is effective in the position; meets departmental standards.', 'Has excellent communication skills; very effective in verbal and written interactions.'],
++            [7, 'one', 'Work Relationship / Behavior', 'Has trouble getting along with other employees, supervisors and Passengers (Public).', 'Has a generally positive approach in assisting others; maintains effective working relationships; meets departmental standards.', 'Exceeds departmental standards; highly cooperative; works hard to promote positive work relationships.'],
++            [8, 'one', 'Safety, Health', 'Fails to follow safety rules, not health concious', 'Follows safety rules and meets departmental standards. Possesses good Health', 'Exceeds departmental standards for safety; maintain good health'],
++            [9, 'one', 'Work Supervision / Independability', 'Often fails to perform his/her duty, shirks responsibility, and very poor in supervisory control', 'Conscientious and steady worker; has a good record of dependability. Always possesses the ability to supervise', 'Very conscientious and dependable; performance of his/her duty is excellent; proficient in supervision'],
++            [10, 'one', 'Job Ethics', 'Likes to work independently not a team Player', 'Likes to work as member of a team (Good Team Player)', 'Possesses the quality to work independently and as a team member'],
++            [11, 'three', 'Overall Work Performance', 'Performance needs improvement to meet Job Requirements.', 'Performance meets Job Requirements', 'Performance exceeds Job Requirements.'],
++        ];
++
++        foreach ($rows as [$code, $section, $title, $low, $mid, $high]) {
++            AppraisalCriterion::updateOrCreate(['code' => $code], [
++                'section' => $section, 'title' => $title,
++                'low_text' => $low, 'mid_text' => $mid, 'high_text' => $high,
++            ]);
++        }
++    }
++}
+diff -ruN orig/resources/views/appraisals/_ratings.blade.php new/resources/views/appraisals/_ratings.blade.php
+--- orig/resources/views/appraisals/_ratings.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/_ratings.blade.php	2026-11-25 04:35:21.053408382 +0000
+@@ -0,0 +1,43 @@
++@foreach($list as $r)
++    @php $c = $r->criterion; @endphp
++    <div class="card mb-2"><div class="card-body">
++        <h5>{{ $c->code }}. {{ $c->title }}</h5>
++        <div class="row">
++            @foreach(['low' => $c->low_text, 'mid' => $c->mid_text, 'high' => $c->high_text] as $k => $text)
++                <div class="col-md-4 mb-2">
++                    <label class="border rounded p-2 d-block h-100 {{ $r->level === $k ? 'bg-light border-primary' : '' }}">
++                        @if($edit)
++                            <input type="radio" name="ratings[{{ $r->id }}][level]" value="{{ $k }}" @checked($r->level === $k)>
++                        @else
++                            {{ $r->level === $k ? '☑' : '☐' }}
++                        @endif
++                        {{ $text }}
++                    </label>
++                </div>
++            @endforeach
++        </div>
++        <div class="row mt-2">
++            <div class="col-md-3">
++                <label class="font-weight-bold">Scale of Marking</label>
++                @if($edit)
++                    <select name="ratings[{{ $r->id }}][marks]" class="form-control" required>
++                        <option value="">--</option>
++                        @for($i = 1; $i <= 10; $i++)
++                            <option value="{{ $i }}" @selected($r->marks == $i)>{{ sprintf('%02d', $i) }}</option>
++                        @endfor
++                    </select>
++                @else
++                    <div><strong>{{ $r->marks ? sprintf('%02d', $r->marks) : '-' }}</strong> / 10</div>
++                @endif
++            </div>
++            <div class="col-md-9">
++                <label class="font-weight-bold">Comments</label>
++                @if($edit)
++                    <textarea name="ratings[{{ $r->id }}][comment]" rows="2" class="form-control">{{ $r->comment }}</textarea>
++                @else
++                    <div>{{ $r->comment ?: '—' }}</div>
++                @endif
++            </div>
++        </div>
++    </div></div>
++@endforeach
+diff -ruN orig/resources/views/appraisals/_review_fields.blade.php new/resources/views/appraisals/_review_fields.blade.php
+--- orig/resources/views/appraisals/_review_fields.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/_review_fields.blade.php	2026-11-25 04:35:21.053416873 +0000
+@@ -0,0 +1,33 @@
++@php
++    $suggest = \App\Support\Scoring::band((float) ($review->marks ?? $appraisal->total_percent ?? 0));
++    $p = $prefix ?? '';
++    $n = fn ($f) => $p ? "{$p}[{$f}]" : $f;
++@endphp
++<div class="row">
++    <div class="col-md-4 form-group">
++        <label>Marks (0-100)</label>
++        <input type="number" step="0.01" min="0" max="100" name="{{ $n('marks') }}" class="form-control"
++               value="{{ old($n('marks'), $review->marks ?? $appraisal->total_percent) }}">
++        <small class="text-muted">Auto total from ratings: {{ $appraisal->total_percent ?? '-' }} ({{ $suggest['label'] }})</small>
++    </div>
++    <div class="col-md-4 form-group">
++        <label>Recommendation</label>
++        <select name="{{ $n('recommendation') }}" class="form-control">
++            @foreach(\App\Support\Scoring::RECOMMENDATIONS as $opt)
++                <option @selected(($review->recommendation ?? $suggest['recommendation']) === $opt)>{{ $opt }}</option>
++            @endforeach
++        </select>
++    </div>
++    <div class="col-md-4 form-group">
++        <label>Increment</label>
++        <select name="{{ $n('increment_steps') }}" class="form-control">
++            @for($i = 1; $i <= 4; $i++)
++                <option value="{{ $i }}" @selected(($review->increment_steps ?? $suggest['steps']) == $i)>{{ $i }}-Step{{ $i > 1 ? 's' : '' }}</option>
++            @endfor
++        </select>
++    </div>
++</div>
++<div class="form-group">
++    <label>Comments</label>
++    <textarea name="{{ $n('comment') }}" rows="3" class="form-control">{{ $review->comment ?? '' }}</textarea>
++</div>
+diff -ruN orig/resources/views/appraisals/create.blade.php new/resources/views/appraisals/create.blade.php
+--- orig/resources/views/appraisals/create.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/create.blade.php	2026-11-25 04:35:21.053394436 +0000
+@@ -0,0 +1,42 @@
++@extends('layouts.master')
++@section('title', 'New Appraisal')
++@section('content')
++<div class="page-wrapper">
++    <div class="content container-fluid">
++        <div class="page-header">
++            <div class="row align-items-center">
++                <div class="col">
++                    <h3 class="page-title">New Appraisal</h3>
++                    <ul class="breadcrumb">
++                        <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
++                        <li class="breadcrumb-item active">New Appraisal</li>
++                    </ul>
++                </div>
++                
++            </div>
++        </div>
++        @if(session('status'))<div class="alert alert-success">{{ session('status') }}</div>@endif
++        @if($errors->any())<div class="alert alert-danger"><ul class="mb-0">@foreach($errors->all() as $e)<li>{{ $e }}</li>@endforeach</ul></div>@endif
++        <div class="card"><div class="card-body">
++            <form method="POST" action="{{ route('appraisals.store') }}">
++                @csrf
++                <div class="form-group">
++                    <label>Employee <small class="text-muted">(only employees with an appraisal supervisor are listed)</small></label>
++                    <select name="employee_id" class="form-control" required>
++                        <option value="">-- select --</option>
++                        @foreach($employees as $e)
++                            <option value="{{ $e->id }}" @selected(old('employee_id') == $e->id)>{{ $e->name }} ({{ $e->employee_id }})</option>
++                        @endforeach
++                    </select>
++                </div>
++                <div class="form-group">
++                    <label>Period (e.g. Jan 2026 - Dec 2026)</label>
++                    <input type="text" name="period" value="{{ old('period') }}" class="form-control" required>
++                </div>
++                <button class="btn btn-primary">Create</button>
++                <a href="{{ route('appraisals.index') }}" class="btn btn-light">Cancel</a>
++            </form>
++        </div></div>
++    </div>
++</div>
++@endsection
+diff -ruN orig/resources/views/appraisals/index.blade.php new/resources/views/appraisals/index.blade.php
+--- orig/resources/views/appraisals/index.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/index.blade.php	2026-11-25 04:35:21.053384852 +0000
+@@ -0,0 +1,42 @@
++@extends('layouts.master')
++@section('title', 'Performance Appraisals')
++@section('content')
++<div class="page-wrapper">
++    <div class="content container-fluid">
++        <div class="page-header">
++            <div class="row align-items-center">
++                <div class="col">
++                    <h3 class="page-title">Performance Appraisals</h3>
++                    <ul class="breadcrumb">
++                        <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
++                        <li class="breadcrumb-item active">Performance Appraisals</li>
++                    </ul>
++                </div>
++                <div class="col-auto">@if(\App\Support\AppraisalAccess::isHr($user))<a href="{{ route('appraisals.setup') }}" class="btn btn-outline-secondary mr-2">Appraisal Setup</a><a href="{{ route('appraisals.create') }}" class="btn btn-primary"><i class="fa fa-plus"></i> New Appraisal</a>@endif</div>
++            </div>
++        </div>
++        @if(session('status'))<div class="alert alert-success">{{ session('status') }}</div>@endif
++        @if($errors->any())<div class="alert alert-danger"><ul class="mb-0">@foreach($errors->all() as $e)<li>{{ $e }}</li>@endforeach</ul></div>@endif
++        <div class="table-responsive">
++            <table class="table table-striped custom-table mb-0">
++                <thead><tr><th>Employee</th><th>Department</th><th>Period</th><th>Total %</th><th>Status</th><th class="text-right">Action</th></tr></thead>
++                <tbody>
++                @forelse($appraisals as $a)
++                    <tr>
++                        <td>{{ $a->employee->name }}<br><small class="text-muted">{{ $a->employee->designation?->name }}</small></td>
++                        <td>{{ $a->employee->department?->name }}</td>
++                        <td>{{ $a->period }}</td>
++                        <td>{{ $a->total_percent ?? '-' }}</td>
++                        <td><span class="badge {{ $a->status === 'completed' ? 'badge-success' : 'badge-warning' }}">{{ $a->statusLabel() }}</span></td>
++                        <td class="text-right"><a class="btn btn-sm btn-info" href="{{ route('appraisals.show', $a) }}">Open</a></td>
++                    </tr>
++                @empty
++                    <tr><td colspan="6" class="text-center text-muted">No appraisals yet.</td></tr>
++                @endforelse
++                </tbody>
++            </table>
++        </div>
++        <div class="mt-3">{{ $appraisals->links() }}</div>
++    </div>
++</div>
++@endsection
+diff -ruN orig/resources/views/appraisals/print.blade.php new/resources/views/appraisals/print.blade.php
+--- orig/resources/views/appraisals/print.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/print.blade.php	2026-11-25 04:35:21.053436199 +0000
+@@ -0,0 +1,77 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<title>Appraisal - {{ $appraisal->employee->name }}</title>
++<style>
++    body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; }
++    h2, h3 { text-align: center; margin: 12px 0 6px; }
++    h3 { background: #ddd; padding: 4px; }
++    table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
++    td, th { border: 1px solid #333; padding: 4px 6px; vertical-align: top; }
++    .box { display: inline-block; width: 11px; height: 11px; border: 1px solid #000; text-align: center; line-height: 11px; font-size: 10px; margin-right: 4px; }
++    .sig { height: 40px; }
++    @media print { .noprint { display: none; } }
++</style>
++</head>
++<body>
++<button class="noprint" onclick="window.print()">Print</button>
++<h2>Employee Performance Appraisal</h2>
++<table>
++    <tr><td><b>Name:</b> {{ $appraisal->employee->name }}</td><td><b>Designation:</b> {{ $appraisal->employee->designation?->name }}</td></tr>
++    <tr><td><b>Employee Code:</b> {{ $appraisal->employee->employee_id }}</td><td><b>Department:</b> {{ $appraisal->employee->department?->name }}</td></tr>
++    <tr><td><b>Period:</b> {{ $appraisal->period }}</td><td><b>Total %:</b> {{ $appraisal->total_percent }}</td></tr>
++</table>
++
++@foreach(['one' => 'Section ONE - Performance Rating', 'three' => 'Section THREE - Overall Work Performance'] as $sec => $title)
++    @if($sec === 'three')
++        <h3>Section TWO - Job Performance Standards</h3>
++        <table>
++            <tr><th>#</th><th>Job Description / Performance</th><th>Satisfactory</th><th>Not Satisfactory</th><th>Std</th></tr>
++            @for($i = 0; $i < 10; $i++)
++                @php $j = $appraisal->jobItems[$i] ?? null; @endphp
++                <tr>
++                    <td>{{ $i + 1 }}</td><td>{{ $j?->description }}</td>
++                    <td align="center">{{ $j && $j->is_satisfactory === true ? '✔' : '' }}</td>
++                    <td align="center">{{ $j && $j->is_satisfactory === false ? '✔' : '' }}</td>
++                    <td align="center">{{ $j?->standard }}</td>
++                </tr>
++            @endfor
++        </table>
++    @endif
++    <h3>{{ $title }}</h3>
++    @foreach($ratings->filter(fn ($r) => $r->criterion->section === $sec) as $r)
++        @php $c = $r->criterion; @endphp
++        <table>
++            <tr><th colspan="3">{{ $c->code }}. {{ $c->title }}</th></tr>
++            <tr>
++                @foreach(['low' => $c->low_text, 'mid' => $c->mid_text, 'high' => $c->high_text] as $k => $t)
++                    <td width="33%"><span class="box">{{ $r->level === $k ? '✔' : '' }}</span>{{ $t }}</td>
++                @endforeach
++            </tr>
++            <tr><td colspan="3"><b>Scale of Marking:</b> {{ $r->marks ? sprintf('%02d', $r->marks) : '' }} / 10 &nbsp;&nbsp; <b>Comments:</b> {{ $r->comment }}</td></tr>
++        </table>
++    @endforeach
++@endforeach
++
++<h3>Section FOUR - Employee's Comment</h3>
++<table><tr><td style="height:70px">{{ $appraisal->employee_comment }}</td></tr>
++<tr><td align="right">Staff's Signature &amp; Date: {{ $appraisal->employee_signed_at?->format('d M Y') }}</td></tr></table>
++
++@foreach(['supervisor' => 'Supervisor', 'hod' => 'Head of Department', 'hr' => 'Human Resource (HR)', 'md' => 'Managing Director'] as $key => $label)
++    @php $rv = $appraisal->review($key); @endphp
++    <h3>This Section filled by {{ $label }}</h3>
++    <table>
++        <tr><th>Marks</th><th>Result</th><th>Recommendation</th><th>Increment</th></tr>
++        <tr>
++            <td align="center">{{ $rv?->marks }}</td>
++            <td align="center">{{ $rv?->result_band }}</td>
++            <td align="center">{{ $rv?->recommendation }}</td>
++            <td align="center">{{ $rv ? $rv->increment_steps . '-Step' . ($rv->increment_steps > 1 ? 's' : '') : '' }}</td>
++        </tr>
++        <tr><td colspan="4"><b>Comments:</b> {{ $rv?->comment }}</td></tr>
++        <tr><td colspan="4" align="right" class="sig">{{ $label }} Signature &amp; Date: {{ $rv ? $rv->reviewer?->name . ' - ' . $rv->signed_at?->format('d M Y') : '' }}</td></tr>
++    </table>
++@endforeach
++</body>
++</html>
+diff -ruN orig/resources/views/appraisals/setup.blade.php new/resources/views/appraisals/setup.blade.php
+--- orig/resources/views/appraisals/setup.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/setup.blade.php	2026-11-25 04:35:21.053400934 +0000
+@@ -0,0 +1,57 @@
++@extends('layouts.master')
++@section('title', 'Appraisal Setup')
++@section('content')
++<div class="page-wrapper">
++    <div class="content container-fluid">
++        <div class="page-header">
++            <div class="row align-items-center">
++                <div class="col">
++                    <h3 class="page-title">Appraisal Setup</h3>
++                    <ul class="breadcrumb">
++                        <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
++                        <li class="breadcrumb-item active">Appraisal Setup</li>
++                    </ul>
++                </div>
++                
++            </div>
++        </div>
++        @if(session('status'))<div class="alert alert-success">{{ session('status') }}</div>@endif
++        @if($errors->any())<div class="alert alert-danger"><ul class="mb-0">@foreach($errors->all() as $e)<li>{{ $e }}</li>@endforeach</ul></div>@endif
++        <p class="text-muted">Choose the appraisal role (Supervisor / HOD / HR / MD) and the supervisor for each employee. Leave role empty for normal employees. HOD acts only on employees of the same department.</p>
++        <form method="POST" action="{{ route('appraisals.setup.save') }}">
++            @csrf
++            <div class="table-responsive">
++                <table class="table table-striped custom-table mb-0">
++                    <thead><tr><th>Employee</th><th>Department</th><th>Appraisal role</th><th>Supervisor</th></tr></thead>
++                    <tbody>
++                    @foreach($users as $u)
++                        <tr>
++                            <td>{{ $u->name }} <small class="text-muted">{{ $u->employee_id }}</small></td>
++                            <td>{{ $u->department?->name }}</td>
++                            <td>
++                                <select name="users[{{ $u->id }}][appraisal_role]" class="form-control form-control-sm">
++                                    <option value="">-</option>
++                                    @foreach($roles as $k => $label)
++                                        <option value="{{ $k }}" @selected($u->appraisal_role === $k)>{{ $label }}</option>
++                                    @endforeach
++                                </select>
++                            </td>
++                            <td>
++                                <select name="users[{{ $u->id }}][appraisal_supervisor_id]" class="form-control form-control-sm">
++                                    <option value="">-</option>
++                                    @foreach($users as $s)
++                                        @continue($s->id === $u->id)
++                                        <option value="{{ $s->id }}" @selected($u->appraisal_supervisor_id == $s->id)>{{ $s->name }}</option>
++                                    @endforeach
++                                </select>
++                            </td>
++                        </tr>
++                    @endforeach
++                    </tbody>
++                </table>
++            </div>
++            <button class="btn btn-primary mt-3">Save</button>
++        </form>
++    </div>
++</div>
++@endsection
+diff -ruN orig/resources/views/appraisals/show.blade.php new/resources/views/appraisals/show.blade.php
+--- orig/resources/views/appraisals/show.blade.php	1970-01-01 00:00:00.000000000 +0000
++++ new/resources/views/appraisals/show.blade.php	2026-11-25 04:35:21.053424493 +0000
+@@ -0,0 +1,128 @@
++@php
++    $editSup = $appraisal->status === 'pending_supervisor' && $canAct;
++    $stages = ['supervisor' => 'Supervisor', 'hod' => 'Head of Department', 'hr' => 'Human Resource (HR)', 'md' => 'Managing Director'];
++@endphp
++@extends('layouts.master')
++@section('title', 'Appraisal')
++@section('content')
++<div class="page-wrapper">
++    <div class="content container-fluid">
++        <div class="page-header">
++            <div class="row align-items-center">
++                <div class="col">
++                    <h3 class="page-title">Appraisal: {{ $appraisal->employee->name }} ({{ $appraisal->period }})</h3>
++                    <ul class="breadcrumb">
++                        <li class="breadcrumb-item"><a href="{{ route('home') }}">Dashboard</a></li>
++                        <li class="breadcrumb-item"><a href="{{ route('appraisals.index') }}">Appraisals</a></li>
++                        <li class="breadcrumb-item active">Form</li>
++                    </ul>
++                </div>
++                <div class="col-auto"><a href="{{ route('appraisals.print', $appraisal) }}" target="_blank" class="btn btn-secondary">Print form</a></div>
++            </div>
++        </div>
++        @if(session('status'))<div class="alert alert-success">{{ session('status') }}</div>@endif
++        @if($errors->any())<div class="alert alert-danger"><ul class="mb-0">@foreach($errors->all() as $e)<li>{{ $e }}</li>@endforeach</ul></div>@endif
++
++        <div class="card"><div class="card-body"><div class="row">
++            <div class="col-md-3"><small class="text-muted d-block">Employee</small>{{ $appraisal->employee->name }}</div>
++            <div class="col-md-3"><small class="text-muted d-block">Designation / ID</small>{{ $appraisal->employee->designation?->name }} / {{ $appraisal->employee->employee_id }}</div>
++            <div class="col-md-3"><small class="text-muted d-block">Department</small>{{ $appraisal->employee->department?->name }}</div>
++            <div class="col-md-3"><small class="text-muted d-block">Status</small><strong>{{ $appraisal->statusLabel() }}</strong></div>
++        </div></div></div>
++
++        @if($editSup)
++        <form method="POST" action="{{ route('appraisals.supervisor', $appraisal) }}">
++            @csrf @method('PUT')
++        @endif
++
++        <h4 class="bg-light p-2 mt-3">Section ONE - Performance Rating</h4>
++        @include('appraisals._ratings', ['list' => $ratings->filter(fn ($r) => $r->criterion->section === 'one'), 'edit' => $editSup])
++
++        <h4 class="bg-light p-2 mt-4">Section TWO - Job Performance Standards</h4>
++        <p class="text-muted small">BS: Below Standard · MS: Meets Standards · ES: Exceeds Standards</p>
++        <div class="table-responsive"><table class="table table-bordered bg-white">
++            <thead><tr><th style="width:40px">#</th><th>Job Description / Performance</th><th>Satisfactory?</th><th>Standard</th></tr></thead>
++            <tbody>
++            @for($i = 0; $i < 10; $i++)
++                @php $j = $appraisal->jobItems[$i] ?? null; @endphp
++                @if($editSup || $j)
++                <tr>
++                    <td>{{ $i + 1 }}</td>
++                    @if($editSup)
++                        <td><input type="text" name="jobs[{{ $i }}][description]" value="{{ $j?->description }}" class="form-control"></td>
++                        <td>
++                            <select name="jobs[{{ $i }}][is_satisfactory]" class="form-control">
++                                <option value="">-</option>
++                                <option value="1" @selected($j && $j->is_satisfactory === true)>Satisfactory</option>
++                                <option value="0" @selected($j && $j->is_satisfactory === false)>Not Satisfactory</option>
++                            </select>
++                        </td>
++                        <td>
++                            <select name="jobs[{{ $i }}][standard]" class="form-control">
++                                <option value="">-</option>
++                                @foreach(['BS', 'MS', 'ES'] as $s)<option @selected($j?->standard === $s)>{{ $s }}</option>@endforeach
++                            </select>
++                        </td>
++                    @else
++                        <td>{{ $j->description }}</td>
++                        <td>{{ $j->is_satisfactory === null ? '-' : ($j->is_satisfactory ? 'Satisfactory' : 'Not Satisfactory') }}</td>
++                        <td>{{ $j->standard ?? '-' }}</td>
++                    @endif
++                </tr>
++                @endif
++            @endfor
++            </tbody>
++        </table></div>
++
++        <h4 class="bg-light p-2 mt-4">Section THREE - Overall Work Performance</h4>
++        @include('appraisals._ratings', ['list' => $ratings->filter(fn ($r) => $r->criterion->section === 'three'), 'edit' => $editSup])
++
++        @if($editSup)
++            <div class="card mt-3"><div class="card-body">
++                <h5>To be filled by Supervisor</h5>
++                @include('appraisals._review_fields', ['review' => $appraisal->review('supervisor'), 'prefix' => 'review'])
++                <small class="text-muted">Leave marks empty to use the auto-calculated total.</small><br>
++                <button class="btn btn-primary mt-3">Submit &amp; sign</button>
++            </div></div>
++        </form>
++        @endif
++
++        <h4 class="bg-light p-2 mt-4">Section FOUR - Employee's Comment</h4>
++        @if($appraisal->status === 'pending_employee' && $canAct)
++            <form method="POST" action="{{ route('appraisals.employee', $appraisal) }}" class="card card-body">
++                @csrf @method('PUT')
++                <small class="text-muted mb-2">Write any other information you would like to inform the management (education/training, drawbacks, self evaluation).</small>
++                <textarea name="employee_comment" rows="5" class="form-control">{{ $appraisal->employee_comment }}</textarea>
++                <button class="btn btn-primary mt-3">Save &amp; sign</button>
++            </form>
++        @else
++            <div class="card card-body" style="white-space:pre-line">{{ $appraisal->employee_comment ?: '—' }}
++                @if($appraisal->employee_signed_at)<small class="text-muted d-block mt-2">Signed: {{ $appraisal->employee_signed_at->format('d M Y H:i') }}</small>@endif
++            </div>
++        @endif
++
++        @foreach($stages as $key => $label)
++            @continue($key === 'supervisor' && $editSup)
++            @php $rv = $appraisal->review($key); $myTurn = $appraisal->status === "pending_$key" && $canAct; @endphp
++            <h4 class="bg-light p-2 mt-4">{{ $label }}</h4>
++            @if($myTurn)
++                <form method="POST" action="{{ route('appraisals.review', [$appraisal, $key]) }}" class="card card-body">
++                    @csrf
++                    @include('appraisals._review_fields', ['review' => $rv, 'prefix' => ''])
++                    <div><button class="btn btn-primary">Submit &amp; sign</button></div>
++                </form>
++            @elseif($rv)
++                <div class="card card-body"><div class="row">
++                    <div class="col-md-3"><small class="text-muted d-block">Marks</small><strong>{{ $rv->marks }}</strong> ({{ $rv->result_band }})</div>
++                    <div class="col-md-3"><small class="text-muted d-block">Recommendation</small>{{ $rv->recommendation }}</div>
++                    <div class="col-md-3"><small class="text-muted d-block">Increment</small>{{ $rv->increment_steps }}-Step{{ $rv->increment_steps > 1 ? 's' : '' }}</div>
++                    <div class="col-md-3"><small class="text-muted d-block">Signed</small>{{ $rv->reviewer?->name }}<br>{{ $rv->signed_at?->format('d M Y') }}</div>
++                    <div class="col-12 mt-2"><small class="text-muted d-block">Comments</small>{{ $rv->comment ?: '—' }}</div>
++                </div></div>
++            @else
++                <div class="card card-body text-muted">Not yet reviewed.</div>
++            @endif
++        @endforeach
++    </div>
++</div>
++@endsection
+diff -ruN orig/resources/views/sidebar/sidebar.blade.php new/resources/views/sidebar/sidebar.blade.php
+--- orig/resources/views/sidebar/sidebar.blade.php	2026-11-25 04:35:20.976867126 +0000
++++ new/resources/views/sidebar/sidebar.blade.php	2026-11-25 04:35:30.717378716 +0000
+@@ -595,6 +595,16 @@
+                             </a>
+                         </li>
+                     @endif
++
++                    @if (\Illuminate\Support\Facades\Route::has('appraisals.index'))
++                        <li class="{{ set_active(['appraisals.*']) }}">
++                            <a href="{{ route('appraisals.index') }}"
++                               class="{{ set_active(['appraisals.*']) ? 'noti-dot' : '' }}">
++                                <i class="la la-clipboard-list"></i>
++                                <span> Performance Appraisal</span>
++                            </a>
++                        </li>
++                    @endif
+                 </div>
+ 
+                 {{-- ================================================================
+diff -ruN orig/routes/modules/appraisal.php new/routes/modules/appraisal.php
+--- orig/routes/modules/appraisal.php	1970-01-01 00:00:00.000000000 +0000
++++ new/routes/modules/appraisal.php	2026-11-25 04:35:21.053355862 +0000
+@@ -0,0 +1,17 @@
++<?php
++
++use App\Http\Controllers\AppraisalController;
++use Illuminate\Support\Facades\Route;
++
++// Loaded inside the authenticated group in routes/web.php ($modules list).
++Route::get('/appraisal-setup', [AppraisalController::class, 'setup'])->name('appraisals.setup');
++Route::post('/appraisal-setup', [AppraisalController::class, 'setupSave'])->name('appraisals.setup.save');
++
++Route::get('/appraisals', [AppraisalController::class, 'index'])->name('appraisals.index');
++Route::get('/appraisals/create', [AppraisalController::class, 'create'])->name('appraisals.create');
++Route::post('/appraisals', [AppraisalController::class, 'store'])->name('appraisals.store');
++Route::get('/appraisals/{appraisal}', [AppraisalController::class, 'show'])->name('appraisals.show');
++Route::get('/appraisals/{appraisal}/print', [AppraisalController::class, 'print'])->name('appraisals.print');
++Route::put('/appraisals/{appraisal}/supervisor', [AppraisalController::class, 'saveSupervisor'])->name('appraisals.supervisor');
++Route::put('/appraisals/{appraisal}/employee', [AppraisalController::class, 'saveEmployee'])->name('appraisals.employee');
++Route::post('/appraisals/{appraisal}/review/{stage}', [AppraisalController::class, 'review'])->name('appraisals.review');
+diff -ruN orig/routes/web.php new/routes/web.php
+--- orig/routes/web.php	2026-11-25 04:35:20.978940082 +0000
++++ new/routes/web.php	2026-11-25 04:35:21.062668416 +0000
+@@ -339,6 +339,7 @@
+             'loans',
+             'fines',
+             'employee_performance',
++            'appraisal',
+             'employee_expenses',
+             'roster',
+             'inventory',

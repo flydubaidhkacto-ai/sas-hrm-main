@@ -595,6 +595,16 @@
                             </a>
                         </li>
                     @endif
+
+                    @if (\Illuminate\Support\Facades\Route::has('appraisals.index'))
+                        <li class="{{ set_active(['appraisals.*']) }}">
+                            <a href="{{ route('appraisals.index') }}"
+                               class="{{ set_active(['appraisals.*']) ? 'noti-dot' : '' }}">
+                                <i class="la la-clipboard-list"></i>
+                                <span> Performance Appraisal</span>
+                            </a>
+                        </li>
+                    @endif
                 </div>
 
                 {{-- ================================================================

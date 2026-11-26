@@ -97,7 +97,7 @@ Route::middleware('guest')->group(function () {
     // -----------------------------login----------------------------------------//
     Route::controller(LoginController::class)->group(function () {
         Route::get('/login', 'login')->name('login');
-        Route::post('/login', 'authenticate')->name('login.post');
+        Route::post('/login', 'authenticate');
     });
     // ------------------------------ register ---------------------------------//
     Route::controller(RegisterController::class)->group(function () {
@@ -339,6 +339,7 @@ Route::middleware([
             'loans',
             'fines',
             'employee_performance',
+            'appraisal',
             'employee_expenses',
             'roster',
             'inventory',

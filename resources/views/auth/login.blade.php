@@ -38,7 +38,7 @@ $gradientColors = "$sidebar_color_left, $sidebar_color_right";
                     <h3 class="account-title">Login</h3>
                     <p class="account-subtitle">Access to our dashboard</p>
                     <!-- Account Form -->
-                    <form method="POST" action="{{ route('login.post') }}">
+                    <form method="POST" action="{{ route('login') }}">
                         @csrf
                         <div class="form-group">
                             <label>Email/Phone</label>
